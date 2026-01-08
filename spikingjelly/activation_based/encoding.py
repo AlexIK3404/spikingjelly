@@ -302,35 +302,61 @@ class LatencyEncoder(StatefulEncoder):
         self.spike = self.spike.permute(d_seq)
 
 
-class PoissonEncoder(StatelessEncoder):
-    def __init__(self, step_mode='s'):
-        """
-        * :ref:`API in English <PoissonEncoder.__init__-en>`
+class PoissonEncoderWithDt(nn.Module):
+    """
+    Poisson encoder with explicit dt control and optional reproducibility.
 
-        .. _PoissonEncoder.__init__-cn:
-
-        无状态的泊松编码器。输出脉冲的发放概率与输入 ``x`` 相同。
-
-        .. warning::
-
-            必须确保 ``0 <= x <= 1``。
-
-        * :ref:`中文API <PoissonEncoder.__init__-cn>`
-
-        .. _PoissonEncoder.__init__-en:
-
-        The poisson encoder will output spike whose firing probability is ``x``。
-
-        .. admonition:: Warning
-            :class: warning
-
-            The user must assert ``0 <= x <= 1``.
-        """
-        super().__init__(step_mode)
+    Args:
+        dt (float): integration step (time per simulation step), same units as 'rate' in x.
+        method (str): 'approx' (p = rate * dt, clipped to [0,1]) or 'exact' (p = 1 - exp(-rate*dt)).
+        seed (int or None): if int, will create a torch.Generator to make sampling reproducible.
+        step_mode (str): kept for API similarity with other encoders (not used inside).
+    Notes:
+        - Input x is interpreted as *rate* (spikes per unit time). If your x is already a
+          probability-per-step for dt=1, then set dt=1 or use encoding.PoissonEncoder directly.
+        - Values x should be >= 0. They need not be <=1 (we don't clamp rates upward), but probabilities are clamped.
+    """
+    def __init__(self, dt: float = 1.0, method: str = 'approx', seed: int = None, step_mode: str = 's'):
+        super().__init__()
+        assert method in ('approx', 'exact')
+        assert dt > 0.0
+        self.dt = float(dt)
+        self.method = method
+        self.seed = seed
+        self.step_mode = step_mode
+        self._gen = None   # torch.Generator, will be created lazily on first forward if seed provided
 
     def forward(self, x: torch.Tensor):
-        out_spike = torch.rand_like(x).le(x).to(x)
-        return out_spike
+        # x: arbitrary shape, interpreted as rate (>=0). Usually from ToTensor -> in [0,1].
+        rate = torch.clamp(x, min=0.0)
+
+        # compute probability for one step of length dt
+        if self.method == 'approx':
+            p = rate * self.dt
+        else:  # exact Poisson: P(at least one spike) = 1 - exp(-rate * dt)
+            p = 1.0 - torch.exp(-rate * self.dt)
+
+        # ensure probability in [0,1]
+        p = torch.clamp(p, min=0.0, max=1.0)
+
+        # reproducible sampling if seed set
+        if self.seed is not None and self._gen is None:
+            # create generator on the same device as x
+            dev = x.device
+            try:
+                self._gen = torch.Generator(device=dev)
+            except TypeError:
+                # older torch may not accept device arg; fall back to cpu generator
+                self._gen = torch.Generator()
+            self._gen.manual_seed(self.seed)
+
+        if self._gen is None:
+            return (torch.rand_like(p) < p).float()
+        else:
+            # note: torch.rand accepts generator argument
+            # make noise on same device/dtype
+            noise = torch.rand(p.shape, dtype=p.dtype, device=p.device, generator=self._gen)
+            return (noise < p).float()
 
 
 class WeightedPhaseEncoder(StatefulEncoder):
