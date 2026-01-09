@@ -302,60 +302,146 @@ class LatencyEncoder(StatefulEncoder):
         self.spike = self.spike.permute(d_seq)
 
 
+import torch
+import torch.nn as nn
+
 class PoissonEncoderWithDt(nn.Module):
     """
-    Poisson encoder with explicit dt control and optional reproducibility.
+    Poisson encoder with explicit dt control and reproducible sampling via local torch.Generator.
+
+    Key idea:
+      - If you want two different models/integrators to see the SAME Poisson spike trains,
+        you must (a) use the same encoder seed and (b) reset the encoder generator to the same
+        state before each run (or before each epoch / batch, depending on experiment design).
 
     Args:
         dt (float): integration step (time per simulation step), same units as 'rate' in x.
-        method (str): 'approx' (p = rate * dt, clipped to [0,1]) or 'exact' (p = 1 - exp(-rate*dt)).
-        seed (int or None): if int, will create a torch.Generator to make sampling reproducible.
+        method (str): 'approx' (p = rate * dt, clipped to [0,1]) or
+                      'exact'  (p = 1 - exp(-rate*dt)).
+        seed (int or None): base seed for reproducibility. Can be changed in reset().
         step_mode (str): kept for API similarity with other encoders (not used inside).
+        force_cpu_generator (bool): if True, always keep generator on CPU (most compatible).
+                                   If False, tries to create generator on x.device if supported.
     Notes:
-        - Input x is interpreted as *rate* (spikes per unit time). If your x is already a
-          probability-per-step for dt=1, then set dt=1 or use encoding.PoissonEncoder directly.
-        - Values x should be >= 0. They need not be <=1 (we don't clamp rates upward), but probabilities are clamped.
+        - Input x is interpreted as *rate* (spikes per unit time).
+          If your x is already probability-per-step (dt=1 convention), use dt=1 or
+          spikingjelly.activation_based.encoding.PoissonEncoder.
+        - Values x should be >= 0. We clamp probabilities to [0,1].
     """
-    def __init__(self, dt: float = 1.0, method: str = 'approx', seed: int = None, step_mode: str = 's'):
+    def __init__(
+        self,
+        dt: float = 1.0,
+        method: str = 'approx',
+        seed: int = None,
+        step_mode: str = 's',
+        force_cpu_generator: bool = False
+    ):
         super().__init__()
         assert method in ('approx', 'exact')
         assert dt > 0.0
+
         self.dt = float(dt)
         self.method = method
         self.seed = seed
         self.step_mode = step_mode
-        self._gen = None   # torch.Generator, will be created lazily on first forward if seed provided
+        self.force_cpu_generator = force_cpu_generator
+
+        # Local RNG state (independent from global torch.manual_seed)
+        self._gen = None
+        self._gen_device = None  # track which device generator corresponds to (best-effort)
+
+    def reset(self, seed: int = None, dt: float = None, device: torch.device = None):
+        """
+        Reset encoder RNG to a known state.
+
+        Use cases:
+          1) Fair integrator comparison:
+             encoder.reset(seed=SEED, device=DEVICE) before running each model/integrator.
+             -> identical Poisson spike trains (given identical call order/shape).
+          2) New randomness per epoch:
+             encoder.reset(seed=SEED + epoch, device=DEVICE)
+          3) Change dt on the fly:
+             encoder.reset(dt=new_dt)
+
+        Args:
+            seed: if provided, overrides self.seed (and stores it).
+            dt: if provided, overrides self.dt (and stores it).
+            device: device where you want RNG to live (best-effort). If None, will be inferred
+                    on first forward from x.device.
+        """
+        if seed is not None:
+            self.seed = int(seed)
+        if dt is not None:
+            assert float(dt) > 0.0
+            self.dt = float(dt)
+
+        # Drop generator so it will be recreated with the new seed/device
+        self._gen = None
+        self._gen_device = None
+
+        # If device is explicitly provided, we can eagerly create generator now
+        if device is not None and self.seed is not None:
+            self._ensure_generator(device)
+
+    def _ensure_generator(self, device: torch.device):
+        """
+        Create generator if needed. Best-effort to place it on desired device when supported.
+        """
+        if self.seed is None:
+            # no reproducibility requested
+            self._gen = None
+            self._gen_device = None
+            return
+
+        if self._gen is not None:
+            # already created
+            return
+
+        # Decide where generator should live:
+        # - If force_cpu_generator=True, always use CPU generator (most compatible)
+        # - Otherwise try generator on same device as x (works in newer PyTorch for CUDA)
+        gen_device = torch.device('cpu') if self.force_cpu_generator else device
+
+        try:
+            self._gen = torch.Generator(device=gen_device)
+            self._gen_device = gen_device
+        except TypeError:
+            # Older PyTorch may not support device=... in torch.Generator()
+            self._gen = torch.Generator()
+            self._gen_device = torch.device('cpu')
+
+        self._gen.manual_seed(int(self.seed))
 
     def forward(self, x: torch.Tensor):
-        # x: arbitrary shape, interpreted as rate (>=0). Usually from ToTensor -> in [0,1].
+        # x: arbitrary shape, interpreted as rate (>=0)
         rate = torch.clamp(x, min=0.0)
 
-        # compute probability for one step of length dt
+        # Compute probability for one step of length dt
         if self.method == 'approx':
+            # Approx for small dt: P(spike) ~ rate * dt
             p = rate * self.dt
-        else:  # exact Poisson: P(at least one spike) = 1 - exp(-rate * dt)
+        else:
+            # Exact Poisson: P(at least one spike) = 1 - exp(-rate * dt)
             p = 1.0 - torch.exp(-rate * self.dt)
 
-        # ensure probability in [0,1]
+        # Ensure probability in [0, 1]
         p = torch.clamp(p, min=0.0, max=1.0)
 
-        # reproducible sampling if seed set
-        if self.seed is not None and self._gen is None:
-            # create generator on the same device as x
-            dev = x.device
-            try:
-                self._gen = torch.Generator(device=dev)
-            except TypeError:
-                # older torch may not accept device arg; fall back to cpu generator
-                self._gen = torch.Generator()
-            self._gen.manual_seed(self.seed)
+        # Ensure generator exists (if reproducibility enabled)
+        self._ensure_generator(x.device)
 
         if self._gen is None:
+            # non-deterministic (uses global RNG)
             return (torch.rand_like(p) < p).float()
         else:
-            # note: torch.rand accepts generator argument
-            # make noise on same device/dtype
-            noise = torch.rand(p.shape, dtype=p.dtype, device=p.device, generator=self._gen)
+            # deterministic sampling using local generator
+            # If generator is on CPU but p is on GPU, torch.rand(..., device='cuda', generator=cpu_gen)
+            # may error on some versions. If that happens, set force_cpu_generator=False or generate on CPU.
+            try:
+                noise = torch.rand(p.shape, dtype=p.dtype, device=p.device, generator=self._gen)
+            except RuntimeError:
+                # Fallback: generate on CPU and move to device
+                noise = torch.rand(p.shape, dtype=p.dtype, device='cpu', generator=self._gen).to(p.device)
             return (noise < p).float()
 
 
